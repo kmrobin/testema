@@ -1,6 +1,6 @@
 ---
 name: refdemo
-description: Replicate the RefDemo base Document Authoring site (aemxsc/refdemo-da) into the current site - all pages, fragments, sheets, assets, page images, structured content schemas, DA site configuration, editor mappings and Edge Delivery headers - with links rewritten to the new site. Use for "set up refdemo content", "replicate the refdemo site", "copy the base DA site", "copy refdemo content and config into my site", "bootstrap this demo site".
+description: Replicate the RefDemo base Document Authoring site (aemxsc/refdemo-da) into the current site - all pages, fragments, sheets, assets, page images, structured content schemas, DA site configuration, editor mappings and Edge Delivery headers - with links rewritten to the new site, then preview everything on Edge Delivery and hand back the DA and preview links. Use for "set up refdemo content", "replicate the refdemo site", "copy the base DA site", "copy refdemo content and config into my site", "bootstrap this demo site".
 ---
 
 # RefDemo site replication
@@ -41,6 +41,20 @@ Link rewriting (in every HTML/JSON file and in the site configuration):
   stores media per site, so these only resolve on the base site. They keep working as long as
   the base site stays published.
 
+When an author opens a copied page, DA re-saves it in its own format and copies those external
+images and videos into the new site (`.<page>/media-<hash>-<id>.jpg`, `shared-media/…`). The
+script compares pages by their main content, ignoring formatting and treating a media file as
+the same when its file name matches. So these re-saved pages count as `unchanged`, are never
+overwritten by a rerun, and the local copy is taken from the target.
+
+## What is previewed
+
+After copying, the script previews on Edge Delivery (`aem.page`) every page, sheet
+(placeholders, tags, mobile, block library and other configuration sheets) and asset it
+copied. Assets go first, then sheets, then pages. Structured content schemas, `.da/` settings
+and the hidden page-image folders are not previewable. Page images are picked up when their
+page is previewed. Nothing is ever published live.
+
 ## Workflow
 
 Run the steps in order without stopping between them. Ask nothing except the single
@@ -76,24 +90,29 @@ exist and differ), `siteConfig`, `orgConfig.added` and `edsHeaders`.
 
 ### 3. Approval (at most one question)
 
-Writing to Document Authoring and Edge Delivery configuration changes the user's remote
-site, so it needs explicit approval.
+Writing to Document Authoring and Edge Delivery configuration, and previewing on Edge
+Delivery, changes the user's remote site, so it needs explicit approval.
 
 - **No question** when the user's message already explicitly asks to copy, replicate or upload
-  the RefDemo content into their DA site **and** the dry run shows no conflicts, or every
-  conflict is one of the blank starter pages (`index.html`, `nav.html`, `footer.html`) of a
-  new site. Go to step 4 with `--on-conflict overwrite`.
-- **Otherwise** ask exactly one question. Include the counts from the dry run and list up to
-  10 conflicting paths. Options:
-  1. **Replicate and replace (Recommended)**. Description: "Copy all RefDemo content and
+  the RefDemo content into their DA site **and to preview it** (for example "replicate the
+  refdemo site into my DA site and preview it"), **and** the dry run shows no conflicts, or
+  every conflict is one of the blank starter pages (`index.html`, `nav.html`, `footer.html`) of
+  a new site. Go to step 4 with `--on-conflict overwrite`.
+- **Otherwise** ask exactly one question. Include the counts from the dry run (files, and the
+  `preview.planned` paths) and list up to 10 conflicting paths. Options (with no conflicts,
+  drop option 2 and leave "replacing …" out of option 1):
+  1. **Replicate and preview (Recommended)**. Description: "Copy all RefDemo content and
      configuration (N files, site configuration, editor mappings, custom headers) into DA site
-     <org>/<site>, replacing the M existing files that differ. Nothing is previewed or
-     published."
-  2. **Replicate, keep existing**. Description: "Copy everything into DA site <org>/<site> but
-     leave the M existing files that differ untouched. Nothing is previewed or published."
-  3. **Cancel**. Description: "Change nothing."
+     <org>/<site>, replacing the M existing files that differ, then preview P pages, sheets and
+     assets on main--<site>--<org>.aem.page. Nothing is published live."
+  2. **Replicate and preview, keep existing**. Description: "Same, but leave the M existing
+     files that differ untouched (and don't preview them). Nothing is published live."
+  3. **Replicate only, no preview**. Description: "Copy everything into DA site <org>/<site>,
+     replacing the M existing files that differ. Nothing is previewed or published."
+  4. **Cancel**. Description: "Change nothing."
 
-  The chosen option approves the remote writes for the rest of this turn.
+  The chosen option approves the remote writes, including the preview, for the rest of this
+  turn.
 
 If a write is blocked by the platform's remote-content safety guard, do not retry it and do
 not work around it. Tell the user the copy was blocked because their message didn't
@@ -106,16 +125,25 @@ the guard's message to send.
 node .claude/refdemo/scripts/replicate-refdemo.mjs --target <org>/<site> --on-conflict <overwrite|skip>
 ```
 
-Add `--preview` only if the user explicitly asked to preview the site in this request. Never
-publish (go live) as part of this skill. Publishing is a separate, explicit request.
+Preview runs by default. Add `--no-preview` when the user chose "Replicate only, no preview",
+or said not to preview. Never publish (go live) as part of this skill. Publishing is a
+separate, explicit request.
 
 Before each upload, the script saves pages locally as `content/<path>.plain.html` and sheets
 as `content/<path>.json`, so the local preview matches Document Authoring. It then uploads
-from those files, reads every file back from the target and compares it. Timeout: allow up
-to 10 minutes.
+from those files, reads every file back from the target and compares it, and then previews
+everything. Timeout: allow up to 10 minutes.
 
-Exit codes: `0` success, `2` some files failed or didn't match on read-back (listed in
-`failures` and `verify.mismatched`), `1` fatal error.
+The run ends with a `=== Links ===` block, also saved as `links` in the report:
+- `daSite`: `https://da.live/#/<org>/<site>`, the site in Document Authoring
+- `editHome`: the home page in the editor its `editor.path` mapping selects (for example
+  `https://da.live/canvas#/<org>/<site>/index`)
+- `previewHome`: `https://main--<site>--<org>.aem.page/`, and `homePreviewed` says whether
+  the preview succeeded
+- `liveHome`: `https://main--<site>--<org>.aem.live/`, which stays unpublished
+
+Exit codes: `0` success; `2` some files failed, didn't match on read-back, or failed to
+preview (listed in `failures`, `verify.mismatched` and `preview.failed`); `1` fatal error.
 
 ### 5. Handle partial failures
 
@@ -130,22 +158,37 @@ Exit codes: `0` success, `2` some files failed or didn't match on read-back (lis
   to the org configuration.
 - **`edsHeaders.error`** (not a site admin): not fatal. Tell the user a site admin needs to add
   the listed headers.
-- **Preview failures**: read `migration-work/preview-publish/last-job.json` before explaining.
+- **Preview failures** (`preview.failed`): read `migration-work/preview-publish/last-job.json`
+  before explaining. The script already retried anything that failed with a server error, one
+  path at a time. A 401 or 403 on every path means the user can't preview this site: they need
+  the publish or author role on the Edge Delivery site. The content is still in Document
+  Authoring. A 502 `AEM_BACKEND_FETCH_FAILED` means Edge Delivery couldn't fetch from the
+  content source in the site configuration. To retry only the preview, rerun step 4. Copied
+  files are `unchanged`, so only the preview runs again.
 
 ### 6. Report to the user
 
-Keep it short and plain. Don't mention scripts, file paths, localhost or tool names. Cover:
+Keep it short and plain. Don't mention scripts, file paths, localhost or tool names. Start
+with the links from the `links` block, as clickable URLs:
+
+- **Open in Document Authoring:** `links.daSite`
+- **Edit the home page:** `links.editHome`
+- **Preview the home page:** `links.previewHome` (if `homePreviewed` is false, say the preview
+  didn't succeed instead of presenting it as working)
+
+Then cover:
 
 - what was copied: number of pages and documents, assets, schemas, and the configuration
   items, with any files skipped or failed
+- what was previewed: `preview.pages` pages, `preview.sheets` sheets, `preview.assets` assets,
+  and any that failed
 - which surfaces changed: **local workspace** (pages and sheets), **Document Authoring**
   (content, site configuration, org editor mappings if added), **Edge Delivery site
-  configuration** (headers, if changed), **Edge Delivery preview** (only with `--preview`),
-  **live** (never)
+  configuration** (headers, if changed), **Edge Delivery preview** (unless `--no-preview`),
+  **live** (never; publishing is a separate request)
 - that images published on the base site still load from it (see link rewriting above)
 - that the AEM Assets repository and IMS org in the site configuration were copied as-is, so
   authors need access to that AEM author to use the asset picker
-- next step: offer to preview the site if it wasn't previewed
 
 ## Options reference
 
@@ -158,7 +201,7 @@ Keep it short and plain. Don't mention scripts, file paths, localhost or tool na
 | `--local-dir <dir>` | `content` | Local mirror of pages and sheets (`""` to disable) |
 | `--no-org-config` | off | Don't append editor mappings to the target org config |
 | `--no-eds-headers` | off | Don't merge Edge Delivery custom headers |
-| `--preview` | off | Bulk-preview everything that was copied (explicit request only) |
+| `--no-preview` | preview on | Skip previewing pages, sheets and assets on `aem.page` |
 | `--report <file>` | `migration-work/refdemo-replication/report.json` | Report location |
 | `--concurrency <n>` | `4` | Parallel requests |
 | `--force-target` | off | Skip the content-source check (explicit request only) |
@@ -174,6 +217,7 @@ as a Bearer token. Never print or log it.
 - Merges configuration and never replaces it: target-only rows, sheets and permissions are
   kept. The org configuration only ever gets `editor.path` rows appended.
 - Every uploaded file is read back and compared.
+- Previews, never publishes.
 
 ## Limitations
 

@@ -21,7 +21,8 @@
  *                           "" to disable)
  *   --no-org-config         Do not add editor.path mappings to the target org config
  *   --no-eds-headers        Do not merge Edge Delivery custom headers
- *   --preview               After copying, bulk-preview all pages, sheets and assets
+ *   --no-preview            Skip the Edge Delivery preview of pages, sheets and assets
+ *                           (preview runs by default after copying; never publishes live)
  *   --report <file>         Report location
  *                           (default: migration-work/refdemo-replication/report.json)
  *   --concurrency <n>       Parallel requests (default: 4)
@@ -50,7 +51,7 @@ function parseArgs(argv) {
     localDir: 'content',
     orgConfig: true,
     edsHeaders: true,
-    preview: false,
+    preview: true,
     report: 'migration-work/refdemo-replication/report.json',
     concurrency: 4,
     forceTarget: false,
@@ -65,7 +66,8 @@ function parseArgs(argv) {
     else if (a === '--local-dir') opts.localDir = next();
     else if (a === '--no-org-config') opts.orgConfig = false;
     else if (a === '--no-eds-headers') opts.edsHeaders = false;
-    else if (a === '--preview') opts.preview = true;
+    else if (a === '--preview') opts.preview = true; // default; kept for compatibility
+    else if (a === '--no-preview') opts.preview = false;
     else if (a === '--report') opts.report = next();
     else if (a === '--concurrency') opts.concurrency = Math.max(1, parseInt(next(), 10) || 4);
     else if (a === '--force-target') opts.forceTarget = true;
@@ -240,12 +242,43 @@ async function getSource(site, rel) {
   return Buffer.from(await res.arrayBuffer());
 }
 
+const MEDIA_EXT = /\.(jpe?g|png|gif|webp|avif|svg|mp4|webm|mov|pdf)$/i;
+
+/**
+ * Identify a media URL by its file name only. When an author opens a page, DA re-saves it and
+ * copies external images/videos into the site (".<page>/media-<hash>-<id>.jpg",
+ * "shared-media/<name>-<id>.mp4"); the slug ignores host, folder and that trailing id.
+ */
+function mediaSlug(url) {
+  let name;
+  try { name = new URL(url.replace(/&amp;/g, '&')).pathname.split('/').pop(); } catch { return null; }
+  if (!name || !MEDIA_EXT.test(name)) return null;
+  return decodeURIComponent(name).toLowerCase()
+    .replace(/[^a-z0-9.]+/g, '-')
+    .replace(/-[0-9a-f]{8}(?=\.[a-z0-9]+$)/, '');
+}
+
+/** Compare HTML as DA sees it: main content only, whitespace-insensitive, media by name. */
+function normHtml(html) {
+  const m = html.match(/<main[^>]*>([\s\S]*)<\/main>/i);
+  return (m ? m[1] : html)
+    .replace(/https?:\/\/[^\s"'<>]+/g, (u) => {
+      const slug = mediaSlug(u);
+      return slug ? `media:${slug}` : u;
+    })
+    .replace(/>\s+</g, '><')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 function sameContent(ext, a, b) {
   if (!a || !b) return false;
+  if (sha(a) === sha(b)) return true;
   if (ext === 'json') {
-    try { return JSON.stringify(JSON.parse(a)) === JSON.stringify(JSON.parse(b)); } catch { /* raw */ }
+    try { return JSON.stringify(JSON.parse(a)) === JSON.stringify(JSON.parse(b)); } catch { return false; }
   }
-  return sha(a) === sha(b);
+  if (ext === 'html') return normHtml(a.toString('utf8')) === normHtml(b.toString('utf8'));
+  return false;
 }
 
 async function putSource(site, rel, ext, buf) {
@@ -356,36 +389,96 @@ function previewPath(rel, ext) {
   return `/${rel}`;
 }
 
-async function bulkPreview(target, paths, report) {
+/**
+ * Everything Edge Delivery can serve: pages, sheets (placeholders, tags, library and other
+ * configuration sheets) and assets. Hidden folders (.da, .<page> image folders) are not
+ * previewable; page images are ingested when their page is previewed.
+ * Assets first, then sheets, then pages, so pages resolve their references on first render.
+ */
+function previewPaths(results) {
+  const rank = (r) => {
+    if (r.ext === 'html') return 2;
+    if (r.ext === 'json') return 1;
+    return 0;
+  };
+  return results
+    .filter((r) => ['created', 'updated', 'unchanged'].includes(r.status))
+    .filter((r) => !r.rel.split('/').some((seg) => seg.startsWith('.')))
+    .sort((a, b) => rank(a) - rank(b) || a.rel.localeCompare(b.rel))
+    .map((r) => previewPath(r.rel, r.ext));
+}
+
+const PREVIEW_CLIENT_ERRORS = [400, 401, 403, 404, 409, 413, 414, 415, 422];
+
+async function previewOne(org, site, p) {
+  try {
+    const res = await req(`${HLX}/preview/${org}/${site}/main${p}`, { method: 'POST' }, { okStatuses: PREVIEW_CLIENT_ERRORS });
+    return { path: p, status: res.status, error: res.ok ? '' : res.headers.get('x-error') || '' };
+  } catch (e) {
+    return { path: p, status: e.status || 0, error: e.message };
+  }
+}
+
+/** Bulk preview job; falls back to (and retries failures with) single-page previews. */
+async function previewAll(target, paths, concurrency, log) {
   const [org, site] = target.split('/');
-  const res = await req(`${HLX}/preview/${org}/${site}/main/*`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ forceUpdate: true, paths }),
-  });
-  const job = await res.json();
-  const jobUrl = job?.links?.self || job?.job?.links?.self;
-  let details = job;
-  if (jobUrl) {
-    for (let i = 0; i < 120; i += 1) {
-      await sleep(5000);
-      const st = await (await req(jobUrl)).json();
-      if (st.state === 'stopped' || st.stopTime) {
-        details = await (await req(`${jobUrl}/details`)).json();
-        break;
+  const status = new Map(paths.map((p) => [p, { path: p, status: 0, error: 'not processed' }]));
+  let details = null;
+  try {
+    const res = await req(`${HLX}/preview/${org}/${site}/main/*`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ forceUpdate: true, paths }),
+    });
+    const job = await res.json();
+    const jobUrl = job?.links?.self || job?.job?.links?.self;
+    details = job;
+    if (jobUrl) {
+      log(`Previewing ${paths.length} paths (bulk job) ...`);
+      for (let i = 0; i < 120; i += 1) {
+        await sleep(5000);
+        const st = await (await req(jobUrl)).json();
+        const state = st.state || st.job?.state;
+        if (state === 'stopped' || st.stopTime || st.job?.stopTime) {
+          details = await (await req(`${jobUrl}/details`)).json();
+          break;
+        }
+      }
+    }
+    const resources = details?.data?.resources || details?.job?.data?.resources || [];
+    for (const r of resources) {
+      if (status.has(r.path)) status.set(r.path, { path: r.path, status: r.status, error: r.error || '' });
+    }
+  } catch (e) {
+    details = { error: e.message };
+    if (e.status === 401 || e.status === 403) {
+      return { details, results: paths.map((p) => ({ path: p, status: e.status, error: e.message })) };
+    }
+  }
+  // Anything not confirmed by the bulk job (or failed with a server error): preview one by one.
+  const retry = [...status.values()].filter((r) => !(r.status >= 200 && r.status < 300) && !PREVIEW_CLIENT_ERRORS.includes(r.status));
+  if (retry.length) {
+    log(`Previewing ${retry.length} paths one by one ...`);
+    const again = await pool(retry, Math.min(concurrency, 3), (r) => previewOne(org, site, r.path));
+    for (const r of again) status.set(r.path, r);
+  }
+  return { details, results: [...status.values()] };
+}
+
+function editUrlFor(daPath, editorRows) {
+  let best = null;
+  for (const r of editorRows) {
+    const v = rowVal(r);
+    const eq = v.indexOf('=');
+    if (eq > 0) {
+      const left = v.slice(0, eq).replace(/\/$/, '').toLowerCase();
+      const right = v.slice(eq + 1);
+      if ((daPath === left || daPath.startsWith(`${left}/`)) && (!best || left.length > best.left.length)) {
+        best = { left, right };
       }
     }
   }
-  const out = 'migration-work/preview-publish/last-job.json';
-  fs.mkdirSync(path.dirname(out), { recursive: true });
-  fs.writeFileSync(out, JSON.stringify(details, null, 2));
-  const resources = details?.data?.resources || [];
-  report.preview = {
-    requested: paths.length,
-    ok: resources.filter((r) => r.status >= 200 && r.status < 300).length,
-    failed: resources.filter((r) => r.status >= 300).map((r) => ({ path: r.path, status: r.status, error: r.error })),
-    jobFile: out,
-  };
+  return `${best ? best.right : 'https://da.live/edit#'}${daPath}`;
 }
 
 /* ------------------------------------------------------------------ main */
@@ -456,6 +549,9 @@ async function main() {
       }
       const existing = await getSource(opts.target, f.rel);
       const unchanged = existing && sameContent(f.ext, existing, body);
+      // Same content, saved differently by DA (or with images copied into the site):
+      // keep the target's version and mirror that locally.
+      if (unchanged) body = existing;
       if (existing && !unchanged && opts.onConflict === 'skip') {
         report.conflicts.push(f.rel);
         return { ...f, status: 'skippedConflict' };
@@ -490,6 +586,7 @@ async function main() {
       return rowKey(r) === 'editor.path' && (left === sitePrefix || left.startsWith(`${sitePrefix}/`));
     })
     .map((r) => JSON.parse(rewrite(JSON.stringify(r)).text));
+  let editorRows = [...orgPaths]; // used to build the "edit home page" link
 
   if (srcSiteCfg || orgPaths.length) {
     const srcSheets = toSheets(srcSiteCfg ? JSON.parse(rewrite(JSON.stringify(srcSiteCfg)).text) : null);
@@ -505,6 +602,7 @@ async function main() {
       tgtSheets[name] = { ...base, data: mergeRows(base.data || [], sheet.data || [], name) };
       if (!base[':colWidths'] && sheet[':colWidths']) tgtSheets[name][':colWidths'] = sheet[':colWidths'];
     }
+    editorRows = (tgtSheets.data?.data || []).filter((r) => rowKey(r) === 'editor.path');
     const merged = fromSheets(tgtSheets);
     const changed = JSON.stringify(toSheets(merged)) !== JSON.stringify(toSheets(tgtCfg));
     if (changed && !opts.dryRun) await postConfig(opts.target, merged);
@@ -582,23 +680,59 @@ async function main() {
     log(`Verified ${toCheck.length} files, ${bad.length} mismatched.`);
   }
 
-  // 7. optional bulk preview (pages, sheets, assets; not .da or hidden page-image folders)
-  if (opts.preview && !opts.dryRun) {
-    const paths = results
-      .filter((r) => ['created', 'updated', 'unchanged'].includes(r.status))
-      .filter((r) => !r.rel.split('/').some((seg) => seg.startsWith('.')))
-      .map((r) => previewPath(r.rel, r.ext));
-    try { await bulkPreview(opts.target, paths, report); } catch (e) { report.preview = { error: e.message }; }
+  // 7. preview pages, sheets and assets on Edge Delivery (default on; --no-preview skips)
+  const paths = previewPaths(results);
+  if (!opts.preview) {
+    report.preview = { skipped: true, planned: paths.length };
+  } else if (opts.dryRun) {
+    report.preview = { planned: paths.length };
+  } else {
+    const { details, results: pr } = await previewAll(opts.target, paths, opts.concurrency, log);
+    const out = 'migration-work/preview-publish/last-job.json';
+    fs.mkdirSync(path.dirname(out), { recursive: true });
+    fs.writeFileSync(out, JSON.stringify({ details, results: pr }, null, 2));
+    const ok = pr.filter((r) => r.status >= 200 && r.status < 300);
+    const count = (re) => ok.filter((r) => re.test(r.path)).length;
+    report.preview = {
+      requested: paths.length,
+      ok: ok.length,
+      pages: ok.filter((r) => !/\.[a-z0-9]+$/i.test(r.path)).length,
+      sheets: count(/\.json$/i),
+      assets: ok.filter((r) => /\.[a-z0-9]+$/i.test(r.path) && !/\.json$/i.test(r.path)).length,
+      failed: pr.filter((r) => !(r.status >= 200 && r.status < 300)),
+      homePreviewed: ok.some((r) => r.path === '/'),
+      jobFile: out,
+    };
+    log(`Previewed ${ok.length}/${paths.length} paths.`);
   }
+
+  // 8. links for the user
+  const [lOrg, lSite] = opts.target.split('/');
+  report.links = {
+    daSite: `https://da.live/#/${lOrg}/${lSite}`,
+    editHome: editUrlFor(`/${lOrg}/${lSite}/index`, editorRows),
+    previewHome: `https://main--${lSite}--${lOrg}.aem.page/`,
+    liveHome: `https://main--${lSite}--${lOrg}.aem.live/`,
+    homePreviewed: !!report.preview?.homePreviewed,
+  };
 
   report.finishedAt = new Date().toISOString();
   fs.mkdirSync(path.dirname(opts.report), { recursive: true });
   fs.writeFileSync(opts.report, JSON.stringify(report, null, 2));
   log(JSON.stringify({ ...report, conflicts: report.conflicts.length }, null, 2));
-  if (report.failures.length || report.verify?.mismatched.length) process.exitCode = 2;
+  log('');
+  log('=== Links ===');
+  log(`Document Authoring site:  ${report.links.daSite}`);
+  log(`Edit home page:           ${report.links.editHome}`);
+  log(`Preview home page:        ${report.links.previewHome}${report.links.homePreviewed ? '' : '  (not previewed yet)'}`);
+  log(`Live home page:           ${report.links.liveHome}  (not published by this script)`);
+  const previewFailed = report.preview?.failed?.length;
+  if (report.failures.length || report.verify?.mismatched.length || previewFailed) process.exitCode = 2;
 }
 
-export { makeRewriter, mergeRows, previewPath };
+export {
+  makeRewriter, mergeRows, previewPath, previewPaths, editUrlFor,
+};
 
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
   main().catch((e) => {
