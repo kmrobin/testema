@@ -1,14 +1,30 @@
 ---
 name: refdemo
-description: Replicate the RefDemo base Document Authoring site (aemxsc/refdemo-da) into the current site - all pages, fragments, sheets, assets, page images, structured content schemas, DA site configuration, editor mappings and Edge Delivery headers - with links rewritten to the new site, then preview everything on Edge Delivery and hand back the DA and preview links. Use for "set up refdemo content", "replicate the refdemo site", "copy the base DA site", "copy refdemo content and config into my site", "bootstrap this demo site".
+description: Set up or refresh a DA demo site by copying the RefDemo base Document Authoring site (aemxsc/refdemo-da) into the user's site - pages, fragments, sheets, assets, page images, structured content schemas, DA site configuration, editor mappings and headers - then preview it and return the DA and preview links. Use whenever the user mentions RefDemo / ref demo / refdemo-da. Also use (after one confirmation question) when the user wants to set up, create, build, bootstrap, populate or get started with a DA demo site, DA site, demo site or their site's demo content, e.g. "set up my DA demo site", "create my demo site", "get my DA site working", "add the demo content to my site", "copy the latest DA demo content", "refresh my demo site", "check what the demo setup would change".
 ---
 
-# RefDemo site replication
+# RefDemo site replication (DA demo site setup)
 
 Copies the RefDemo base site into the user's current site in one pass, with at most one
 question. The code base is https://github.com/AEMXSC/RefDemo-da; the content and
 configuration come from Document Authoring `aemxsc/refdemo-da`
-(https://da.live/#/aemxsc/refdemo-da).
+(https://da.live/#/aemxsc/refdemo-da). Users call the result a **DA demo site**; use that
+term (and "DA demo content") in everything you tell them.
+
+## When this skill applies
+
+| The user's message | What to do |
+|---|---|
+| Mentions **RefDemo** in any form ("refdemo", "ref demo", "RefDemo-da", "the refdemo skill") | Use this skill directly. Its explicit wording counts as the confirmation in step 3. |
+| Asks to set up, create, build, bootstrap, populate, refresh, re-sync or get started with a **DA demo site, DA site, demo site, demo content**, or "my site" when the repository is RefDemo-based, **without** mentioning RefDemo | Use this skill, but confirm first. The step 3 question also asks whether to use the RefDemo setup (see "Confirming the skill"). Never start copying on an assumption. |
+| Anything else about a DA site (edit a page, fix a block, migrate a website, publish a page, style changes) | Not this skill. |
+
+"RefDemo-based repository" means `tools/content-assistant/` and `tools/task-management/`
+exist. If they don't and RefDemo wasn't mentioned, still ask, and say in the question that
+the site's code isn't from the DA demo template.
+
+A dry-run request ("check what the demo setup would change", "what would be copied") runs
+steps 1 and 2 only, reports the result, and asks nothing.
 
 All work is done by `scripts/replicate-refdemo.mjs` (next to this file). Run it from the
 repository root. Do not copy files by hand, do not write your own copy loop, and do not
@@ -93,26 +109,44 @@ exist and differ), `siteConfig`, `orgConfig.added` and `edsHeaders`.
 Writing to Document Authoring and Edge Delivery configuration, and previewing on Edge
 Delivery, changes the user's remote site, so it needs explicit approval.
 
-- **No question** when the user's message already explicitly asks to copy, replicate or upload
-  the RefDemo content into their DA site **and to preview it** (for example "replicate the
-  refdemo site into my DA site and preview it"), **and** the dry run shows no conflicts, or
-  every conflict is one of the blank starter pages (`index.html`, `nav.html`, `footer.html`) of
-  a new site. Go to step 4 with `--on-conflict overwrite`.
-- **Otherwise** ask exactly one question. Include the counts from the dry run (files, and the
-  `preview.planned` paths) and list up to 10 conflicting paths. Options (with no conflicts,
-  drop option 2 and leave "replacing …" out of option 1):
-  1. **Replicate and preview (Recommended)**. Description: "Copy all RefDemo content and
-     configuration (N files, site configuration, editor mappings, custom headers) into DA site
-     <org>/<site>, replacing the M existing files that differ, then preview P pages, sheets and
-     assets on main--<site>--<org>.aem.page. Nothing is published live."
-  2. **Replicate and preview, keep existing**. Description: "Same, but leave the M existing
+- **No question** only when all of these are true:
+  - the user's message mentions RefDemo;
+  - it explicitly asks to copy, replicate, set up or upload into their DA / Document
+    Authoring site **and to preview it** (for example "use refdemo to copy everything into my
+    Document Authoring site and preview it");
+  - the dry run shows no conflicts, or every conflict is one of the blank starter pages
+    (`index.html`, `nav.html`, `footer.html`) of a new site.
+
+  Go to step 4 with `--on-conflict overwrite`.
+- **Otherwise** ask exactly one question. It confirms the skill, if needed, and approves the
+  changes together. Include the counts from the dry run (files, and the `preview.planned`
+  paths) and list up to 10 conflicting paths. Options (with no conflicts, drop option 2 and
+  leave "replacing …" out of option 1):
+  1. **Set up with RefDemo and preview (Recommended)**. Description: "Use the RefDemo skill
+     to copy all DA demo content and configuration (N files, site configuration, editor
+     mappings, custom headers) into DA site <org>/<site>, replacing the M existing files that
+     differ, then preview P pages, sheets and assets on main--<site>--<org>.aem.page. Nothing
+     is published live."
+  2. **Set up with RefDemo, keep my changes**. Description: "Same, but leave the M existing
      files that differ untouched (and don't preview them). Nothing is published live."
-  3. **Replicate only, no preview**. Description: "Copy everything into DA site <org>/<site>,
-     replacing the M existing files that differ. Nothing is previewed or published."
-  4. **Cancel**. Description: "Change nothing."
+  3. **Set up with RefDemo, no preview**. Description: "Copy everything into DA site
+     <org>/<site>, replacing the M existing files that differ. Nothing is previewed or
+     published."
+  4. **No, something else**. Description: "Don't use the RefDemo setup. Change nothing; I'll
+     say what I need."
 
   The chosen option approves the remote writes, including the preview, for the rest of this
-  turn.
+  turn. If the user picks "No, something else", stop and help with what they describe
+  instead.
+
+### Confirming the skill
+
+When RefDemo wasn't mentioned, phrase the question so a solution consultant who has never
+heard of RefDemo understands it. For example: "Do you want me to set up your DA demo site
+with the RefDemo skill? It copies the standard DA demo content (N pages and files, images,
+block library, structured content and settings) into <org>/<site> and previews it." Ask it
+after the dry run, so the counts are real. The dry run is read-only and safe to run before
+confirming.
 
 If a write is blocked by the platform's remote-content safety guard, do not retry it and do
 not work around it. Tell the user the copy was blocked because their message didn't
@@ -168,8 +202,10 @@ preview (listed in `failures`, `verify.mismatched` and `preview.failed`); `1` fa
 
 ### 6. Report to the user
 
-Keep it short and plain. Don't mention scripts, file paths, localhost or tool names. Start
-with the links from the `links` block, as clickable URLs:
+Keep it short and plain; the readers are mostly Adobe solution consultants, not developers.
+Say "DA demo site" and "DA demo content". Don't mention scripts, file paths, localhost, tool
+names, dry runs or report fields. Start with "Your DA demo site is ready" (or what went
+wrong) and the links from the `links` block, as clickable URLs:
 
 - **Open in Document Authoring:** `links.daSite`
 - **Edit the home page:** `links.editHome`
